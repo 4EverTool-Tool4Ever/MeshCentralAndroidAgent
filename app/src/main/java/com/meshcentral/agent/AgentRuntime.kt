@@ -334,11 +334,21 @@ object AgentController : AgentHost {
         if (!hasAuthorizedDesktopTunnel()) return
         keepScreenAwake()
         if (isRemoteDesktopRunning()) return
+        if (ScreenCaptureService.canResumeWithoutPrompt()) {
+            // Below Android 11: the projection granted earlier is still held, resume it silently.
+            val tunnel = authorizedDesktopTunnel() ?: return
+            cancelProjectionRetry()
+            ContextCompat.startForegroundService(appContext,
+                ScreenCaptureService.getResumeIntent(appContext, tunnel.consentId))
+            return
+        }
+        // Accessibility screenshots exist from Android 11 only; below, asking would just fail.
+        val accessibilityCapture = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
         val accessibility = MeshAccessibilityService.instance
-        if (accessibility != null) {
+        if (accessibilityCapture && accessibility != null) {
             cancelProjectionRetry()
             if (accessibility.startDesktop()) return
-        } else if (isAccessibilityServiceEnabled() && waitForAccessibilityProjection()) {
+        } else if (accessibilityCapture && isAccessibilityServiceEnabled() && waitForAccessibilityProjection()) {
             // Unattended access is granted but the accessibility service has not rebound yet (common
             // right after an app update). Wait for it to connect instead of reporting setup as missing.
             return
@@ -359,6 +369,16 @@ object AgentController : AgentHost {
                 mainActivity.promptScreenShareChoice(tunnel.consentId)
             }
             return
+        }
+        if (ProjectionConsentActivity.supported) {
+            // Wall tablet showing another app: put the one-time capture consent on screen anyway.
+            try {
+                ProjectionConsentActivity.start(appContext, tunnel.consentId)
+                sendDesktopMessage("Waiting for the screen capture consent on the device (asked once).", timeoutSeconds = null)
+                return
+            } catch (ex: Exception) {
+                println("Projection consent activity failed: $ex")
+            }
         }
 
         sendDesktopMessage("Remote desktop requires Accessibility unattended access or an open app screen for Android capture consent.", timeoutSeconds = null)
@@ -541,6 +561,10 @@ object AgentController : AgentHost {
             for (t in desktopTunnels) t.Stop()
         }
         if (isRemoteDesktopRunning()) stopProjection()
+        // Stopped by hand on the device: drop the kept projection too, the next session asks again.
+        if (ScreenCaptureService.hasGrant) {
+            appContext.startService(ScreenCaptureService.getReleaseIntent(appContext))
+        }
         refreshInfo()
     }
 

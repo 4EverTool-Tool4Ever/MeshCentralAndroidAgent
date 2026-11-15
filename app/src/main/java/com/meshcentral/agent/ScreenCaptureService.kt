@@ -21,6 +21,7 @@ import android.os.CountDownTimer
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.util.DisplayMetrics
 import android.view.Display
 import android.view.OrientationEventListener
 import android.view.WindowManager
@@ -45,9 +46,13 @@ class ScreenCaptureService : Service(), RemoteDesktopProvider {
     private var forceFullFrame = false
     private val encoder = DesktopFrameEncoder()
     private var lastFrameBitmap: Bitmap? = null
+    // Below Android 11 there is no accessibility capture, so the projection is the only way to see
+    // the screen. Between two sessions it is parked (no virtual display, no frames) instead of being
+    // stopped: the next session resumes it without asking the device user again.
+    @Volatile private var parked = false
 
     override val isRunning: Boolean
-        get() = mMediaProjection != null
+        get() = mMediaProjection != null && !parked
 
     override val width: Int
         get() = mWidth
@@ -125,7 +130,7 @@ class ScreenCaptureService : Service(), RemoteDesktopProvider {
 
     private inner class OrientationChangeCallback internal constructor(context: Context?) : OrientationEventListener(context) {
         override fun onOrientationChanged(orientation: Int) {
-            if (mDisplay == null) return;
+            if (mDisplay == null || parked) return;
             val rotation = mDisplay!!.rotation
             //println("rotation $rotation")
             if (rotation != mRotation) {
@@ -136,6 +141,7 @@ class ScreenCaptureService : Service(), RemoteDesktopProvider {
                         // Nop
                     }
                     override fun onFinish() {
+                        if (parked) return
                         try {
                             // Clean up
                             if (mVirtualDisplay != null) mVirtualDisplay!!.release()
@@ -159,7 +165,10 @@ class ScreenCaptureService : Service(), RemoteDesktopProvider {
     private inner class MediaProjectionStopCallback : MediaProjection.Callback() {
         override fun onStop() {
             //Log.e(ScreenCaptureService.Companion.TAG, "stopping projection.")
+            // Projection revoked (cast notification, system): the saved grant is no longer usable.
+            clearGrant()
             mHandler?.post {
+                parked = false
                 releaseDisplayResources()
                 mOrientationChangeCallback?.disable()
                 mOrientationChangeCallback = null
@@ -219,10 +228,29 @@ class ScreenCaptureService : Service(), RemoteDesktopProvider {
                 @Suppress("DEPRECATION")
                 intent.getParcelableExtra<Intent>(ScreenCaptureService.Companion.DATA)
             }
+            if (resultCode == Activity.RESULT_OK && data != null) saveGrant(resultCode, data)
             startProjection(resultCode, data)
+        } else if (isResumeCommand(intent)) {
+            val sessionId = intent.getStringExtra(SESSION_ID)
+            val notification: Pair<Int, Notification> = NotificationUtils.getNotification(this)
+            startForeground(notification.first!!, notification.second)
+            if (sessionId == null || !AgentController.isDesktopSessionAuthorized(sessionId)) {
+                if (mMediaProjection == null) stopSelf()
+                return START_NOT_STICKY
+            }
+            if (mMediaProjection == null) {
+                // Service was recreated: rebuild the projection from the grant kept in memory.
+                val code = grantResultCode
+                val data = grantData
+                if (data == null) { stopSelf(); return START_NOT_STICKY }
+                startProjection(code, data)
+            } else {
+                mHandler?.post { resumeProjection() }
+            }
         } else if (ScreenCaptureService.Companion.isStopCommand(intent)) {
-            stopProjection()
-            stopSelf()
+            val release = intent.getBooleanExtra(RELEASE, false) || !keepAliveSupported
+            stopProjection(release)
+            if (release || mMediaProjection == null) stopSelf()
         } else {
             stopSelf()
         }
@@ -235,8 +263,8 @@ class ScreenCaptureService : Service(), RemoteDesktopProvider {
             try {
                 mMediaProjection = mpManager.getMediaProjection(resultCode, data!!)
             } catch (ex: Exception) {
-                // Unable to get the projection manager.
-                // TODO: Deal with this situation nicely.
+                // The saved grant may have been invalidated; forget it so the next session asks again.
+                clearGrant()
             }
             if (mMediaProjection != null) {
                 // Display metrics
@@ -259,6 +287,7 @@ class ScreenCaptureService : Service(), RemoteDesktopProvider {
                     mOrientationChangeCallback!!.enable()
                 }
 
+                parked = false
                 g_ScreenCaptureService = this
                 g_remoteDesktopProvider = this
                 updateTunnelDisplaySize()
@@ -274,10 +303,50 @@ class ScreenCaptureService : Service(), RemoteDesktopProvider {
         }
     }
 
-    private fun stopProjection() {
+    // Runs on mHandler. Re-attaches a parked projection to the new session: no system prompt.
+    private fun resumeProjection() {
+        if (mMediaProjection == null || !parked) return
+        if (!AgentController.hasAuthorizedDesktopTunnel()) return
+        parked = false
+        try {
+            createVirtualDisplay()
+        } catch (e: Exception) {
+            e.printStackTrace()
+            parked = true
+            return
+        }
+        mOrientationChangeCallback?.enable()
+        encoder.requestFullFrame()
+        g_ScreenCaptureService = this
+        g_remoteDesktopProvider = this
+        updateTunnelDisplaySize()
+        AgentController.desktopProviderStarted()
+        sendAgentConsole("Resumed display sharing")
+    }
+
+    // Runs on mHandler. Keeps the projection token, drops everything that costs CPU or battery.
+    private fun parkProjection() {
+        parked = true
+        mOrientationChangeCallback?.disable()
+        releaseDisplayResources()
+        lastFrameBitmap?.recycle()
+        lastFrameBitmap = null
+        if (g_ScreenCaptureService === this) g_ScreenCaptureService = null
+        if (g_remoteDesktopProvider === this) g_remoteDesktopProvider = null
+        sendAgentConsole("Paused display sharing")
+        AgentController.refreshInfo()
+    }
+
+    private fun stopProjection(release: Boolean) {
         if (mHandler != null) {
             mHandler!!.post {
                 if (mMediaProjection != null) {
+                    if (!release) {
+                        parkProjection()
+                        return@post
+                    }
+                    clearGrant()
+                    parked = false
                     mMediaProjection!!.stop()
                     g_ScreenCaptureService = null
                     if (g_remoteDesktopProvider === this) {
@@ -304,9 +373,19 @@ class ScreenCaptureService : Service(), RemoteDesktopProvider {
 
     @SuppressLint("WrongConstant")
     private fun createVirtualDisplay() {
-        // Get width and height
-        mWidth = Resources.getSystem().displayMetrics.widthPixels
-        mHeight = Resources.getSystem().displayMetrics.heightPixels
+        // Real size, navigation bar included: Resources.getSystem().displayMetrics leaves it out on
+        // Android 7, which squeezed the whole screen into a shorter frame and shifted every tap.
+        val metrics = DisplayMetrics()
+        val display = mDisplay
+        if (display != null) {
+            @Suppress("DEPRECATION")
+            display.getRealMetrics(metrics)
+            mWidth = metrics.widthPixels
+            mHeight = metrics.heightPixels
+        } else {
+            mWidth = Resources.getSystem().displayMetrics.widthPixels
+            mHeight = Resources.getSystem().displayMetrics.heightPixels
+        }
 
         sendAgentConsole("Screen: $mWidth x $mHeight")
         updateTunnelDisplaySize()
@@ -332,6 +411,49 @@ class ScreenCaptureService : Service(), RemoteDesktopProvider {
         private const val ACTION = "ACTION"
         private const val START = "START"
         private const val STOP = "STOP"
+        private const val RESUME = "RESUME"
+        private const val RELEASE = "RELEASE"
+
+        // Projection grant kept for the life of the process (the agent's foreground service keeps it
+        // alive). An Intent carrying a projection binder cannot be persisted, so a reboot or a
+        // reinstall still needs one tap on the device.
+        @Volatile private var grantResultCode = Activity.RESULT_CANCELED
+        @Volatile private var grantData: Intent? = null
+
+        val keepAliveSupported: Boolean
+            get() = android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R
+
+        val hasGrant: Boolean
+            get() = grantData != null
+
+        fun canResumeWithoutPrompt(): Boolean = keepAliveSupported && grantData != null
+
+        private fun saveGrant(resultCode: Int, data: Intent) {
+            if (!keepAliveSupported) return
+            grantResultCode = resultCode
+            grantData = data
+        }
+
+        private fun clearGrant() {
+            grantResultCode = Activity.RESULT_CANCELED
+            grantData = null
+        }
+
+        fun getResumeIntent(context: Context?, sessionId: String): Intent {
+            val intent = Intent(context, ScreenCaptureService::class.java)
+            intent.putExtra(ACTION, RESUME)
+            intent.putExtra(SESSION_ID, sessionId)
+            return intent
+        }
+
+        // Ends sharing for good: the projection is stopped and the grant forgotten.
+        fun getReleaseIntent(context: Context?): Intent {
+            return getStopIntent(context).putExtra(RELEASE, true)
+        }
+
+        private fun isResumeCommand(intent: Intent): Boolean {
+            return intent.getStringExtra(ACTION) == RESUME
+        }
         private const val SCREENCAP_NAME = "screencap"
         fun getStartIntent(context: Context?, resultCode: Int, data: Intent?, sessionId: String): Intent {
             val intent = Intent(context, ScreenCaptureService::class.java)
